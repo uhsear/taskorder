@@ -53,8 +53,9 @@ MEANING = {
     CHANGED: "the chain ran in order and the last stage found rows",
     NOTHING_CHANGED: "the chain ran in order and the last stage found no rows",
     ORDERED: "the chain ran in order (no row count was given)",
-    NOT_RUN: "a stage did not run in this cycle; an empty report proves nothing",
-    FAILED: "a stage ran and failed in this cycle; an empty report proves nothing",
+    NOT_RUN: "a stage did not run when it should have; an empty report "
+             "proves nothing",
+    FAILED: "a stage ran and failed; an empty report proves nothing",
     INVERTED: "stages ran out of the declared order; the last stage compared "
               "the wrong data",
     UNKNOWN: "the history cannot answer; do not read an empty report as "
@@ -172,6 +173,8 @@ def load_runs(path):
             data = json.loads(text)
         except ValueError as exc:
             raise InputError("%s is not valid JSON (%s)" % (safe(path), exc))
+        except RecursionError:
+            raise InputError("%s is nested too deeply for JSON" % safe(path))
         if not isinstance(data, list):
             raise InputError("%s: JSON must be an array of objects"
                              % safe(path))
@@ -182,7 +185,10 @@ def load_runs(path):
                                  % safe(path))
             pairs.append(list(item.items()))
         return runs_from_pairs(pairs)
-    rows = list(csv.reader(io.StringIO(text)))
+    try:
+        rows = list(csv.reader(io.StringIO(text)))
+    except csv.Error as exc:
+        raise InputError("%s is not readable CSV (%s)" % (safe(path), exc))
     header = rows[0]
     pairs = []
     for row in rows[1:]:
@@ -221,7 +227,9 @@ def analyse(runs, chain, rows=None, window_hours=DEFAULT_WINDOW_HOURS):
     stage must have an ok run that finished before the next stage started and
     inside one cycle (window_hours before the judged run). A run of an earlier
     stage that starts after a later chosen stage finished, but before the
-    judged run, means the order was broken.
+    judged run, means the order was broken. The judged run is only believed
+    if nothing newer contradicts it: a failed run of any stage after it, or a
+    chain that ran on for more than one cycle without a newer last-stage run.
     """
     keys = [name.casefold() for name in chain]
     last = len(chain) - 1
@@ -247,10 +255,27 @@ def analyse(runs, chain, rows=None, window_hours=DEFAULT_WINDOW_HOURS):
     floor = start - datetime.timedelta(hours=window_hours)
     covered = min(r.started for r in runs) <= floor
     chosen = {last: judged}
+    # The newest evidence beats the judged run. The tool has no clock, so
+    # "newer" means newer than the judged run inside the history.
+    for i, key in enumerate(keys):
+        bad = [r.started for r in runs
+               if r.key == key and not r.ok and r.started > start]
+        if bad:
+            add(FAILED, chain[i], "%s failed at %s, after the judged %s "
+                "started at %s" % (chain[i], max(bad).strftime(FMT),
+                                   chain[last], start.strftime(FMT)))
+    ahead = [r.started for r in runs if r.key in keys
+             and r.started > start + datetime.timedelta(hours=window_hours)]
+    if ahead and not any(r.key == keys[last] and r.started > start
+                         for r in runs):
+        add(NOT_RUN, chain[last], "no run of %s after the judged one at %s, "
+            "but the chain ran as late as %s, more than %s h later"
+            % (chain[last], start.strftime(FMT), max(ahead).strftime(FMT),
+               _hours(window_hours)))
     bound = start
     for i in range(last - 1, -1, -1):
-        mine = [r for r in runs
-                if r.key == keys[i] and _end(r) >= floor and r.started < start]
+        mine = [r for r in runs if r.key == keys[i]
+                and _end(r) >= floor and r.started <= start]
         ok = [r for r in mine if r.ok]
         before = [r for r in ok if r.finished <= bound]
         if before:
@@ -282,7 +307,7 @@ def analyse(runs, chain, rows=None, window_hours=DEFAULT_WINDOW_HOURS):
         for j in [k for k in chosen if k < i]:
             for r in runs:
                 if (r.key == keys[j] and r.ok
-                        and chosen[i].finished < r.started < start):
+                        and chosen[i].finished <= r.started <= start):
                     add(INVERTED, chain[j], "%s ran again at %s, after %s "
                         "finished at %s and before %s started"
                         % (chain[j], r.started.strftime(FMT), chain[i],
@@ -423,6 +448,9 @@ def main(argv=None):
         return run_cli(args)
     except InputError as exc:
         return fail(str(exc))
+    except OverflowError:
+        return fail("a time or --window-hours is outside the range that "
+                    "dates can be calculated in")
 
 
 # ---------------------------------------------------------------- self-test
@@ -451,11 +479,14 @@ def harness():
             failed.append(label)
             print("FAIL  %s" % label)
 
-    def raises(fn, label, exc_type=InputError):
+    def raises(fn, label, exc_type=InputError, text=None):
+        """fn must raise exc_type; with text, the message must hold it."""
         try:
             fn()
-        except exc_type:
-            check(True, label)
+        except exc_type as exc:
+            check(text is None or text in str(exc),
+                  label if text is None or text in str(exc)
+                  else "%s (message %r)" % (label, str(exc)))
         except Exception as exc:
             check(False, "%s (wrong exception %r)" % (label, exc))
         else:
@@ -484,10 +515,10 @@ def self_test():
     def ts(day, hhmm):
         return "2026-03-%02d %s:00" % (day, hhmm)
 
-    def mk(task, day, start, end, ok=True):
+    def mk(task, day, start, end, ok=True, end_day=None):
         return Run(task, task.casefold(), parse_time(ts(day, start), "t")[0],
-                   parse_time(ts(day, end), "t")[0] if end else None, ok,
-                   False)
+                   parse_time(ts(end_day or day, end), "t")[0] if end
+                   else None, ok, False)
 
     chain = ["snapshot", "refresh", "compare"]
 
@@ -588,6 +619,58 @@ def self_test():
           == NOT_RUN,
           "the same history with a window it does cover is NOT_RUN")
 
+    # ---- the newest evidence beats the judged run
+    cmp_fail = healthy + [mk("compare", 6, "06:00", "06:01", ok=False)]
+    rep = analyse(cmp_fail, chain, rows=0)
+    check(rep["verdict"] == FAILED and rep["findings"][0]["stage"] == "compare"
+          and "failed at 2026-03-06 06:00:00" in rep["findings"][0]["text"],
+          "a newer compare that failed is FAILED, not a quiet night from the "
+          "older compare  <-- pinned defect")
+    check(rep["judged"].started == parse_time(ts(5, "06:00"), "t")[0],
+          "and the report still shows which ok compare it looked at")
+    check(any("NOTE: the empty report" in line for line in render(rep)),
+          "and says the empty report proves nothing")
+    check(analyse(healthy + [mk("compare", 6, "06:00", None, ok=False)],
+                  chain)["verdict"] == FAILED,
+          "a newer compare that failed and has no finished time is FAILED")
+    check(analyse(healthy + [mk("compare", 5, "06:00", "06:01", ok=False)],
+                  chain)["verdict"] == ORDERED,
+          "a failed compare that started with the judged one is not newer")
+    stopped = day(3) + day(4) + day(5, cmp_=None) + day(6, cmp_=None)
+    rep = analyse(stopped, chain, rows=0)
+    check(rep["verdict"] == NOT_RUN and rep["findings"][0]["stage"] == "compare"
+          and "ran as late as 2026-03-06 02:00:00" in rep["findings"][0]["text"],
+          "a compare that stopped running while the chain went on is NOT_RUN, "
+          "not the old compare's verdict  <-- pinned defect")
+    waiting = day(3) + day(4) + day(5, cmp_=None)
+    check(analyse(waiting, chain, rows=0)["verdict"] == NOTHING_CHANGED,
+          "a new cycle that is still waiting for its compare is not flagged")
+    edge = day(3) + day(4) + [mk("snapshot", 5, "06:00", "06:01")]
+    check(analyse(edge, chain)["verdict"] == ORDERED,
+          "a run exactly one cycle after the judged compare is not flagged")
+    check(analyse(edge, chain, window_hours=23.5)["verdict"] == NOT_RUN,
+          "a run just over one cycle after the judged compare is NOT_RUN")
+    check(analyse(healthy + [mk("compare", 7, "06:00", "06:01")], chain,
+                  rows=0)["judged"].started
+          == parse_time(ts(7, "06:00"), "t")[0],
+          "a newer ok compare is the one judged")
+    fail_after = day(3) + day(4) + day(5, cmp_=None, ref=None) + \
+        [mk("refresh", 5, "02:00", "02:09", ok=False)]
+    rep = analyse(fail_after, chain, rows=0)
+    check(rep["verdict"] == FAILED and rep["findings"][0]["stage"] == "refresh",
+          "a refresh that failed after the judged compare is FAILED  "
+          "<-- pinned defect")
+    other = healthy + [mk("other", 6, "06:00", "06:01", ok=False),
+                       mk("other", 9, "06:00", "06:01")]
+    check(analyse(other, chain, rows=0)["verdict"] == NOTHING_CHANGED,
+          "a task that is not in the chain is ignored, failed or late")
+    check(not any("NOTE:" in line
+                  for line in render(analyse(no_refresh, chain))),
+          "no empty-report note when no row count was given")
+    check(not any("NOTE:" in line
+                  for line in render(analyse(no_refresh, chain, rows=4))),
+          "no empty-report note when the report had rows")
+
     # ---- precedence and ordering of findings
     mixed = day(5, snap=None, ref=None)
     rep = analyse(mixed, chain, rows=0)
@@ -643,6 +726,85 @@ def self_test():
           and rep["chosen"][1].started == parse_time(ts(5, "04:00"), "t")[0],
           "a refresh rerun after the snapshot is the one chosen, and in "
           "order")
+
+    # ---- the edges of the window and of the order
+    cs = ["a", "b"]
+    b_end = mk("b", 5, "06:00", "06:05")
+    check(analyse([mk("other", 4, "06:00", "06:01"), b_end], cs)["verdict"]
+          == NOT_RUN,
+          "a history that starts exactly where the window opens is long "
+          "enough: NOT_RUN, not UNKNOWN")
+    check(analyse([mk("a", 4, "05:50", "06:00"), b_end], cs)["verdict"]
+          == ORDERED,
+          "a run that finishes exactly where the window opens counts")
+    rep = analyse([mk("other", 3, "01:00", "01:01"),
+                   mk("a", 5, "06:00", "06:01"), b_end], cs)
+    check(rep["verdict"] == INVERTED,
+          "a stage that starts the second the last stage starts was not "
+          "before it: INVERTED")
+    long_run = mk("a", 4, "07:00", "02:00", end_day=5)
+    check(analyse([long_run, mk("b", 5, "08:00", "08:05")], cs)["verdict"]
+          == ORDERED,
+          "a run that began before the window opened and finished inside it "
+          "counts")
+    rep = analyse([mk("a", 5, "01:00", "03:00"), mk("a", 5, "02:00", "02:30"),
+                   b_end], cs)
+    check(rep["chosen"][0].started == parse_time(ts(5, "01:00"), "t")[0],
+          "of two ok runs, the one that finished last is chosen")
+    long_snap = [mk("snapshot", 5, "01:00", "02:10"),
+                 mk("refresh", 5, "02:00", "02:20"),
+                 mk("compare", 5, "06:00", "06:05")]
+    rep = analyse(long_snap, chain)
+    check(rep["verdict"] == INVERTED
+          and rep["findings"][0]["stage"] == "snapshot",
+          "a snapshot still running when the refresh started is INVERTED "
+          "in a three-stage chain")
+    at_finish = day(5) + [mk("snapshot", 5, "02:20", "02:21")]
+    check(analyse(at_finish, chain)["verdict"] == INVERTED,
+          "a snapshot rerun that starts the second the refresh finished is "
+          "INVERTED")
+    at_start = day(5) + [mk("snapshot", 5, "06:00", "06:01")]
+    check(analyse(at_start, chain)["verdict"] == INVERTED,
+          "a snapshot rerun that starts the second the compare starts is "
+          "INVERTED")
+    instant = day(5, cmp_=None) + [mk("compare", 5, "06:00", "06:00"),
+                                   mk("snapshot", 5, "06:00", "06:01")]
+    check(len(analyse(instant, chain)["findings"]) == 1,
+          "a late snapshot is reported once, not again against the last "
+          "stage")
+    unk = day(5, snap=None, ref=None) + [mk("refresh", 5, "02:00", "02:09",
+                                            ok=False)]
+    rep = analyse(unk, chain, rows=0)
+    check(rep["verdict"] == FAILED
+          and sorted(f["code"] for f in rep["findings"]) == [FAILED, UNKNOWN],
+          "a definite problem beats UNKNOWN in the headline, and both are "
+          "listed")
+    late_fail = analyse(healthy + [mk("compare", 7, "07:00", "07:01",
+                                      ok=False)], chain, rows=0)
+    check([f["code"] for f in late_fail["findings"]] == [FAILED],
+          "a failed compare more than a cycle later is FAILED alone, not "
+          "also NOT_RUN")
+    two_fail = analyse(healthy + [mk("compare", 6, "06:00", "06:01", ok=False),
+                                  mk("compare", 8, "06:00", "06:01",
+                                     ok=False)], chain, rows=0)
+    check("failed at 2026-03-08 06:00:00" in two_fail["findings"][0]["text"],
+          "the finding names the latest failed run")
+    # known limits, pinned so a change is seen (see Limits in the README)
+    check(analyse(day(3) + day(4) + day(5)
+                  + [mk("snapshot", 5, "03:00", "03:02", ok=False)],
+                  chain)["verdict"] == ORDERED,
+          "known limit: a failed snapshot rerun between refresh and compare "
+          "is not seen")
+    check(analyse(day(3) + day(4) + day(5)
+                  + [mk("snapshot", 5, "02:05", "02:07")],
+                  chain)["verdict"] == ORDERED,
+          "known limit: a snapshot rerun that starts inside the refresh and "
+          "ends before the compare is not seen")
+    check(analyse(day(3) + day(4) + day(5)
+                  + [mk("refresh", 5, "05:55", "06:10")],
+                  chain)["verdict"] == ORDERED,
+          "known limit: a refresh rerun that overlaps the start of the "
+          "compare is not seen")
 
     # ---- window and the cycle
     wide = day(3) + day(5, snap=None, ref=None)
@@ -705,6 +867,9 @@ def self_test():
                             ("Result", " OK ")]])[0].ok is True,
           "column names and result are read without regard to case or "
           "spaces")
+    check(runs_from_pairs(pairs(finished=ts(5, "06:00")))[0].finished
+          == runs_from_pairs(pairs())[0].started,
+          "a run that finishes the second it starts is accepted")
     r = runs_from_pairs(pairs(finished="", result="fail"))[0]
     check(r.finished is None and r.ok is False,
           "a fail row may have no finished time")
@@ -724,8 +889,15 @@ def self_test():
            "a run that finishes before it starts is refused")
     raises(lambda: runs_from_pairs(pairs(started=7)),
            "a number where text belongs is refused")
-    raises(lambda: runs_from_pairs([[("task", "x"), ("TASK", "y")]]),
-           "a column that appears twice is refused  <-- pinned defect")
+    full = [("started", ts(5, "01:00")), ("finished", ts(5, "01:01")),
+            ("result", "ok")]
+    raises(lambda: runs_from_pairs([[("task", "x"), ("TASK", "y")] + full]),
+           "a column that appears twice is refused  <-- pinned defect",
+           text="appears twice")
+    raises(lambda: runs_from_pairs([[("task", "x")] + full
+                                    + [("Result", "fail")]]),
+           "a repeated result column is refused, not read as the last one  "
+           "<-- pinned defect", text="appears twice")
     raises(lambda: runs_from_pairs([[("task", "x")]]),
            "a row missing a column is refused")
     raises(lambda: runs_from_pairs(
@@ -796,13 +968,24 @@ def self_test():
                "a JSON object in place of an array is refused")
         raises(lambda: load_runs(put("arr.json", "[1]")),
                "a JSON array of non-objects is refused")
-        raises(lambda: load_runs(put("long.csv", head + "a,b,c,ok,extra\n")),
-               "a CSV row with more cells than the header is refused")
+        raises(lambda: load_runs(put("long.csv", head + "a,%s,%s,ok,extra\n"
+                                     % (ts(5, "01:00"), ts(5, "01:01")))),
+               "a CSV row with more cells than the header is refused  "
+               "<-- pinned defect", text="more cells")
         raises(lambda: load_runs(put("short.csv", head + "a,b\n")),
                "a CSV row with too few cells is refused")
         raises(lambda: load_runs(put("dup.csv", "task,Task,started,finished,"
-                                     "result\na,b,c,d,ok\n")),
-               "a CSV header with a repeated column is refused")
+                                     "result\na,b,%s,%s,ok\n"
+                                     % (ts(5, "01:00"), ts(5, "01:01")))),
+               "a CSV header with a repeated column is refused",
+               text="appears twice")
+        raises(lambda: load_runs(put("big.csv", head + "a,%s,%s,ok\n"
+                                     % ("9" * 200000, ts(5, "01:01")))),
+               "a CSV field over the csv size limit is refused, not a "
+               "traceback", text="not readable CSV")
+        raises(lambda: load_runs(put("deep.json", "[" * 100000)),
+               "a JSON history nested 100000 deep is refused, not a "
+               "traceback", text="nested too deeply")
 
         # ---- the CLI on real files
         base = ["--history", csv_path, "--chain", "snapshot,refresh,compare"]
@@ -881,11 +1064,13 @@ def self_test():
         listed = set(os.listdir(tmp))
         code, out, _ = cli(base + ["--rows", "0", "--report", rpt,
                                    "--apply"])
-        with open(rpt, "r", encoding="ascii") as h:
-            written = h.read()
+        with open(rpt, "rb") as h:
+            written = h.read().decode("ascii")
         check(code == 0 and written.endswith("VERDICT: NOTHING_CHANGED\n")
-              and written.count("\n") == len(out.splitlines()),
-              "--report with --apply writes the report")
+              and written.count("\n") == len(out.splitlines())
+              and "\r" not in written,
+              "--report with --apply writes the report, with plain newlines "
+              "on every host")
         check(set(os.listdir(tmp)) - listed == set(["order.txt"]),
               "the report file is the only file --apply adds")
         with open(csv_path, "rb") as h:
@@ -897,6 +1082,22 @@ def self_test():
               and after == before,
               "--report naming the history file is refused and the history "
               "is intact  <-- pinned defect")
+        # A symlink needs a privilege on Windows, so the alias is a stub of
+        # os.path.realpath. The real symlink run is in the README.
+        alias = os.path.join(tmp, "alias.csv")
+        real_path = os.path.realpath
+        os.path.realpath = lambda p: real_path(
+            csv_path if os.path.basename(p) == "alias.csv" else p)
+        try:
+            code, _, err = cli(base + ["--report", alias, "--apply"])
+        finally:
+            os.path.realpath = real_path
+        with open(csv_path, "rb") as h:
+            after = h.read()
+        check(code == 2 and "refusing to overwrite" in err
+              and after == before and not os.path.exists(alias),
+              "--report that resolves to the history file is refused, "
+              "whatever its spelling  <-- pinned defect")
         code, _, err = cli(base + ["--report", tmp, "--apply"])
         check(code == 2 and "cannot write" in err,
               "a report path that cannot be written exits 2")
@@ -904,16 +1105,47 @@ def self_test():
         check(code == 2 and "--apply needs --report" in err,
               "--apply without --report exits 2")
 
+        # ---- exit codes are a contract: a scheduler reads them
+        def dump(name, runs):
+            lines = [head.rstrip("\n")]
+            for r in runs:
+                lines.append("%s,%s,%s,%s" % (
+                    r.task, r.started.strftime(FMT),
+                    r.finished.strftime(FMT) if r.finished else "",
+                    "ok" if r.ok else "fail"))
+            return put(name, "\n".join(lines) + "\n")
+
+        for name, runs, verdict in (("FAILED", failed_ref, "FAILED"),
+                                    ("newer-fail", cmp_fail, "FAILED"),
+                                    ("INVERTED", inverted, "INVERTED"),
+                                    ("stopped", stopped, "NOT_RUN")):
+            code, out, _ = cli(["--history", dump(name + ".csv", runs),
+                                "--chain", "snapshot,refresh,compare",
+                                "--rows", "0"])
+            check(code == 1 and "VERDICT: %s" % verdict in out,
+                  "the CLI exits 1 for %s (%s)" % (verdict, name))
+        for bad in ("0", "-1", "nan", "inf"):
+            code, _, err = cli(base + ["--window-hours", bad])
+            check(code == 2 and "--window-hours must be" in err,
+                  "--window-hours %s is refused by the flag check" % bad)
+        for big in ("1e9", "1e300"):
+            code, out, err = cli(base + ["--window-hours", big])
+            check(code == 2 and "outside the range" in err and not out,
+                  "--window-hours %s exits 2, not a traceback  "
+                  "<-- pinned defect" % big)
+        year1 = put("year1.csv", head + "a,0001-01-01 00:00:00+05:00,"
+                    "0001-01-01 00:01:00+05:00,ok\n")
+        code, _, err = cli(["--history", year1, "--chain", "a,b"])
+        check(code == 2 and "outside the range" in err,
+              "a time near year 1 with an offset exits 2, not a traceback  "
+              "<-- pinned defect")
+
     # ---- usage errors
     code, _, err = cli(["--chain", "a,b"])
     check(code == 2 and "--history is required" in err,
           "no --history exits 2")
     code, _, err = cli(["--history", "x"])
     check(code == 2 and "--chain is required" in err, "no --chain exits 2")
-    for bad in ("0", "-1", "nan", "inf"):
-        code, _, err = cli(["--history", "x", "--chain", "a,b",
-                            "--window-hours", bad])
-        check(code == 2, "--window-hours %s is refused" % bad)
     code, _, err = cli(["--history", "x", "--chain", "a,b", "--rows", "-1"])
     check(code == 2 and "negative" in err, "--rows -1 is refused")
     code, _, err = cli(["--history", "x", "--chain", "a,b", "--rows", "z"])
@@ -940,13 +1172,17 @@ def self_test():
         raises2(lambda: None, "no raise")
         raises2(lambda: 1 / 0, "wrong raise")
         raises2(lambda: parse_chain("x"), "right raise")
+        raises2(lambda: parse_chain("x"), "right text", text="at least two")
+        raises2(lambda: parse_chain("x"), "wrong text", text="zzz")
     finally:
         sys.stdout = real
-    check(p2[0] == 2 and f2 == ["bad", "no raise (no error raised)",
+    check(p2[0] == 3 and f2 == ["bad", "no raise (no error raised)",
                                 "wrong raise (wrong exception "
-                                "ZeroDivisionError('division by zero'))"],
-          "the harness counts a failed check, a missing raise and a wrong "
-          "exception")
+                                "ZeroDivisionError('division by zero'))",
+                                "wrong text (message '--chain needs at least "
+                                "two stages, separated by commas')"],
+          "the harness counts a failed check, a missing raise, a wrong "
+          "exception and a message without the expected text")
     check(analyse(healthy, chain, rows=0)["verdict"]
           != analyse([], chain, rows=0)["verdict"],
           "a healthy history and an empty one do not give the same verdict")
