@@ -9,6 +9,7 @@ history (one row per task run) and the declared order of the chain, and says
 which one it was. An empty history is UNKNOWN, never "nothing changed".
 
     python taskorder.py --history runs.csv --chain snapshot,refresh,compare --rows 0
+    python taskorder.py ... --now "2026-03-06 07:00:00"
     python taskorder.py ... --report order.txt --apply
     python taskorder.py --self-test
 
@@ -16,7 +17,9 @@ History columns (any case, CSV or a JSON array of objects):
     task, started, finished, result
 started and finished are YYYY-MM-DD HH:MM:SS (24-hour, or with T), with an
 optional Z or +HH:MM. result is ok or fail. finished may be blank only for a
-fail row.
+fail row. --now is when the history was exported, in the same form; without it
+the system clock is used. A last stage that has not run for more than one
+cycle before that time is NOT_RUN.
 
 Nothing is written without --apply, and only the --report file is ever
 written. The tool needs only the Python standard library, no network and no
@@ -63,7 +66,6 @@ MEANING = {
 }
 
 DEFAULT_WINDOW_HOURS = 24.0
-FMT = "%Y-%m-%d %H:%M:%S"
 FIELDS = ("task", "started", "finished", "result")
 
 Run = namedtuple("Run", "task key started finished ok utc")
@@ -74,6 +76,22 @@ _TIME = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})"
 
 class InputError(ValueError):
     """The input or the flags cannot be used. The tool exits 2."""
+
+
+def stamp(when):
+    """YYYY-MM-DD HH:MM:SS. strftime('%Y') pads years below 1000 on Windows
+    and not on Linux, so the report would differ by host."""
+    return "%04d-%02d-%02d %02d:%02d:%02d" % (
+        when.year, when.month, when.day, when.hour, when.minute, when.second)
+
+
+def system_now(utc):
+    """The clock, in the same form as the history: UTC when its times carry
+    an offset, local wall time when they do not."""
+    if utc:
+        return datetime.datetime.now(datetime.timezone.utc).replace(
+            tzinfo=None)
+    return datetime.datetime.now()
 
 
 def safe(text):
@@ -220,7 +238,8 @@ def _end(run):
     return run.finished if run.finished is not None else run.started
 
 
-def analyse(runs, chain, rows=None, window_hours=DEFAULT_WINDOW_HOURS):
+def analyse(runs, chain, rows=None, window_hours=DEFAULT_WINDOW_HOURS,
+            now=None):
     """The pure decision core. No I/O.
 
     Judges the latest ok run of the last stage. Walking back, each earlier
@@ -230,6 +249,9 @@ def analyse(runs, chain, rows=None, window_hours=DEFAULT_WINDOW_HOURS):
     judged run, means the order was broken. The judged run is only believed
     if nothing newer contradicts it: a failed run of any stage after it, or a
     chain that ran on for more than one cycle without a newer last-stage run.
+    With now (the same form as the run times), a last stage with no run for
+    more than one cycle since the judged run finished is NOT_RUN. The core
+    calls no clock: with now=None that check is skipped.
     """
     keys = [name.casefold() for name in chain]
     last = len(chain) - 1
@@ -252,6 +274,12 @@ def analyse(runs, chain, rows=None, window_hours=DEFAULT_WINDOW_HOURS):
     judged = max(done, key=lambda r: (r.started, r.finished))
     report["judged"] = judged
     start = judged.started
+    newest = max(_end(r) for r in runs)
+    if now is not None and now < newest:
+        add(UNKNOWN, None, "now is %s, before the newest run in the history "
+            "at %s; check --now, the clock and the time zone"
+            % (stamp(now), stamp(newest)))
+        now = None
     floor = start - datetime.timedelta(hours=window_hours)
     covered = min(r.started for r in runs) <= floor
     chosen = {last: judged}
@@ -262,17 +290,25 @@ def analyse(runs, chain, rows=None, window_hours=DEFAULT_WINDOW_HOURS):
                if r.key == key and not r.ok and r.started > start]
         if bad:
             add(FAILED, chain[i], "%s failed at %s, after the judged %s "
-                "started at %s" % (chain[i], max(bad).strftime(FMT),
-                                   chain[last], start.strftime(FMT)))
+                "started at %s" % (chain[i], stamp(max(bad)),
+                                   chain[last], stamp(start)))
     ahead = [r.started for r in runs if r.key in keys
              and r.started > start + datetime.timedelta(hours=window_hours)]
-    if ahead and not any(r.key == keys[last] and r.started > start
-                         for r in runs):
+    no_newer = not any(r.key == keys[last] and r.started > start
+                       for r in runs)
+    if ahead and no_newer:
         add(NOT_RUN, chain[last], "no run of %s after the judged one at %s, "
             "but the chain ran as late as %s, more than %s h later"
-            % (chain[last], start.strftime(FMT), max(ahead).strftime(FMT),
+            % (chain[last], stamp(start), stamp(max(ahead)),
                _hours(window_hours)))
+    elif (now is not None and no_newer and now > judged.finished
+          + datetime.timedelta(hours=window_hours)):
+        add(NOT_RUN, chain[last], "no run of %s after the judged one at %s, "
+            "and now is %s, more than %s h after it finished"
+            % (chain[last], stamp(start), stamp(now), _hours(window_hours)))
     bound = start
+    earlier = [r.started for r in done if r.started < start]
+    prev = max(earlier) if earlier else None
     for i in range(last - 1, -1, -1):
         mine = [r for r in runs if r.key == keys[i]
                 and _end(r) >= floor and r.started <= start]
@@ -280,13 +316,26 @@ def analyse(runs, chain, rows=None, window_hours=DEFAULT_WINDOW_HOURS):
         before = [r for r in ok if r.finished <= bound]
         if before:
             pick = max(before, key=lambda r: r.finished)
+            # An ok run from before the previous compare belongs to the
+            # previous cycle. A failed run of this stage since then is this
+            # cycle's, and the stage did not refresh.
+            lost = [r.started for r in runs
+                    if r.key == keys[i] and not r.ok
+                    and prev is not None and prev < r.started <= start
+                    and pick.finished <= prev]
+            if lost:
+                add(FAILED, chain[i], "%s failed at %s in this cycle, and its "
+                    "only ok run, at %s, was before the previous %s at %s"
+                    % (chain[i], stamp(max(lost)), stamp(pick.started),
+                       chain[last], stamp(prev)))
+                continue
             chosen[i] = pick
             bound = pick.started
         elif [r for r in ok if r.finished > bound]:
             late = max(r.started for r in ok if r.finished > bound)
             add(INVERTED, chain[i], "%s only ran at %s, after %s had started "
-                "at %s" % (chain[i], late.strftime(FMT), chain[i + 1],
-                           bound.strftime(FMT)))
+                "at %s" % (chain[i], stamp(late), chain[i + 1],
+                           stamp(bound)))
         elif mine:
             add(FAILED, chain[i], "%s ran in this cycle and every run failed"
                 % chain[i])
@@ -296,8 +345,8 @@ def analyse(runs, chain, rows=None, window_hours=DEFAULT_WINDOW_HOURS):
         else:
             add(UNKNOWN, chain[i], "no run of %s in the window, and the "
                 "history starts at %s, after the window opens at %s"
-                % (chain[i], min(r.started for r in runs).strftime(FMT),
-                   floor.strftime(FMT)))
+                % (chain[i], stamp(min(r.started for r in runs)),
+                   stamp(floor)))
     report["chosen"] = chosen
     for i in sorted(chosen):
         if i == last:
@@ -310,8 +359,8 @@ def analyse(runs, chain, rows=None, window_hours=DEFAULT_WINDOW_HOURS):
                         and chosen[i].finished <= r.started <= start):
                     add(INVERTED, chain[j], "%s ran again at %s, after %s "
                         "finished at %s and before %s started"
-                        % (chain[j], r.started.strftime(FMT), chain[i],
-                           chosen[i].finished.strftime(FMT), chain[last]))
+                        % (chain[j], stamp(r.started), chain[i],
+                           stamp(chosen[i].finished), chain[last]))
     return _finish(report)
 
 
@@ -349,7 +398,7 @@ def render(report, utc=False):
     if judged is not None:
         rows = report["rows"]
         out.append("judged: %s, started %s%s, rows reported: %s"
-                   % (safe(chain[-1]), judged.started.strftime(FMT),
+                   % (safe(chain[-1]), stamp(judged.started),
                       " UTC" if utc else "",
                       "not given" if rows is None else rows))
         for i, name in enumerate(chain):
@@ -358,8 +407,8 @@ def render(report, utc=False):
                 out.append("  %-12s no run chosen" % safe(name))
             else:
                 out.append("  %-12s %s .. %s  ok" % (
-                    safe(name), run.started.strftime(FMT),
-                    run.finished.strftime(FMT)))
+                    safe(name), stamp(run.started),
+                    stamp(run.finished)))
     for f in report["findings"]:
         out.append("FINDING %s: %s" % (f["code"], safe(f["text"])))
     if report["rows"] == 0 and report["verdict"] in DEFINITE + (UNKNOWN,):
@@ -386,6 +435,8 @@ def build_parser():
     ap.add_argument("--window-hours", dest="window_hours", type=float,
                     help="length of one cycle (default %s)"
                     % _hours(DEFAULT_WINDOW_HOURS))
+    ap.add_argument("--now", help="when the history was exported, in the "
+                    "form of its times (default: the system clock)")
     ap.add_argument("--report", help="write the report to this file")
     ap.add_argument("--apply", action="store_true",
                     help="write --report; without it nothing is written")
@@ -399,7 +450,7 @@ def fail(message):
     return 2
 
 
-def run_cli(args):
+def run_cli(args, clock=system_now):
     if not args.history:
         raise InputError("--history is required")
     if not args.chain:
@@ -418,8 +469,16 @@ def run_cli(args):
         raise InputError("--report is the history file; refusing to "
                          "overwrite it")
     runs = load_runs(args.history)
-    report = analyse(runs, chain, args.rows, window)
-    lines = render(report, utc=bool(runs) and runs[0].utc)
+    utc = bool(runs) and runs[0].utc
+    if args.now is None:
+        now = clock(utc)
+    else:
+        now, aware = parse_time(args.now, "--now")
+        if runs and aware != utc:
+            raise InputError("--now and the history must both use a Z or "
+                             "+HH:MM offset, or both none")
+    report = analyse(runs, chain, args.rows, window, now)
+    lines = render(report, utc=utc)
     print("\n".join(lines))
     if args.report:
         if not args.apply:
@@ -436,16 +495,16 @@ def run_cli(args):
     return EXIT[report["verdict"]]
 
 
-def main(argv=None):
+def main(argv=None, clock=system_now):
     args = build_parser().parse_args(argv)
     if args.self_test:
         if (args.history or args.chain or args.rows is not None
                 or args.window_hours is not None or args.report
-                or args.apply):
+                or args.now is not None or args.apply):
             return fail("--self-test takes no other flag")
         return self_test()
     try:
-        return run_cli(args)
+        return run_cli(args, clock)
     except InputError as exc:
         return fail(str(exc))
     except OverflowError:
@@ -499,13 +558,17 @@ def self_test():
     """Assertions over the decision core and the CLI. Offline."""
     passed, failed, check, raises = harness()
 
-    def cli(argv):
-        """(exit code, stdout, stderr) of main(argv) in this process."""
+    noon = datetime.datetime(2026, 3, 5, 7, 0, 0)
+
+    def cli(argv, clock_at=noon):
+        """(exit code, stdout, stderr) of main(argv) in this process, with a
+        fixed clock so that no assertion depends on today's date."""
         real = sys.stdout, sys.stderr
         sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
         try:
             try:
-                code = main(argv)
+                code = main(argv) if clock_at is None else main(
+                    argv, clock=lambda utc: clock_at)
             except SystemExit as exc:
                 code = exc.code
             return code, sys.stdout.getvalue(), sys.stderr.getvalue()
@@ -829,6 +892,121 @@ def self_test():
     check(analyse(three, ["a", "b", "c"])["verdict"] == ORDERED,
           "three stages in order are ORDERED")
 
+    # ---- the clock: a compare that stopped, seen on the first morning
+    def when(d, hhmm, sec="00"):
+        return parse_time("2026-03-%02d %s:%s" % (d, hhmm, sec), "t")[0]
+
+    day1 = healthy + day(6, cmp_=None)
+    rep = analyse(day1, chain, rows=0, now=when(6, "08:00"))
+    check(rep["verdict"] == NOT_RUN and rep["findings"][0]["stage"] == "compare"
+          and "now is 2026-03-06 08:00:00" in rep["findings"][0]["text"],
+          "the morning after the compare stopped, with the clock given, is "
+          "NOT_RUN, not a quiet night  <-- pinned defect")
+    check(analyse(day1, chain, rows=0)["verdict"] == NOTHING_CHANGED,
+          "the core calls no clock: with no now it cannot tell, and says so "
+          "only through the CLI")
+    check(analyse(day1, chain, rows=0, now=when(6, "05:00"))["verdict"]
+          == NOTHING_CHANGED,
+          "a compare that is not yet due at the clock time is not flagged")
+    check(analyse(day1, chain, rows=0, now=when(6, "06:05"))["verdict"]
+          == NOTHING_CHANGED,
+          "a compare due exactly now is not yet late")
+    check(analyse(day1, chain, rows=0, now=when(6, "06:05", "01"))["verdict"]
+          == NOT_RUN,
+          "a compare one second later than the judged finish plus one cycle "
+          "is late")
+    check(analyse(day1, chain, rows=0, now=when(6, "07:00"),
+                  window_hours=48)["verdict"] == NOTHING_CHANGED,
+          "a longer cycle moves the due time with it")
+    rep = analyse(healthy, chain, rows=0,
+                  now=datetime.datetime(2026, 10, 24, 9, 0, 0))
+    check(rep["verdict"] == NOT_RUN,
+          "a whole chain that stopped months ago is NOT_RUN, not a clean "
+          "verdict  <-- pinned defect")
+    rep = analyse(stopped, chain, rows=0,
+                  now=datetime.datetime(2026, 10, 24, 9, 0, 0))
+    check([f["code"] for f in rep["findings"]] == [NOT_RUN],
+          "a stopped compare that the chain ran past is listed once, not "
+          "twice")
+    rep = analyse(cmp_fail, chain, rows=0,
+                  now=datetime.datetime(2026, 10, 24, 9, 0, 0))
+    check([f["code"] for f in rep["findings"]] == [FAILED],
+          "a newer failed compare is FAILED alone: the compare did run")
+    rep = analyse(healthy, chain, rows=0, now=when(4, "00:00"))
+    check(rep["verdict"] == UNKNOWN and rep["findings"][0]["stage"] is None
+          and "before the newest run" in rep["findings"][0]["text"],
+          "a clock earlier than the newest run is UNKNOWN: the clock or the "
+          "zone is wrong")
+    check(analyse(healthy, chain, rows=0, now=when(5, "06:05"))["verdict"]
+          == NOTHING_CHANGED,
+          "a clock equal to the newest finish is accepted")
+    running = healthy + [mk("snapshot", 6, "05:00", "09:00")]
+    rep = analyse(running, chain, rows=0, now=when(6, "07:00"))
+    check([f["code"] for f in rep["findings"]] == [UNKNOWN],
+          "a clock inside the newest run is UNKNOWN alone: the clock cannot "
+          "also date a late compare")
+    check(analyse([], chain, rows=0, now=when(5, "06:05"))["verdict"]
+          == UNKNOWN, "an empty history stays UNKNOWN with a clock")
+
+    # ---- the judged run is the newest start, not the newest finish
+    rep = analyse(day(4) + day(5, cmp_=None)
+                  + [mk("compare", 5, "06:00", "07:00"),
+                     mk("compare", 5, "06:30", "06:35")], chain, rows=0)
+    check(rep["judged"].started == when(5, "06:30"),
+          "of two ok compares, the one that started last is judged, not the "
+          "one that finished last  <-- pinned defect")
+
+    # ---- an ok run from the previous cycle does not hide this cycle's failure
+    prev_cycle = [mk("snapshot", 4, "06:30", "06:32"),
+                  mk("refresh", 4, "07:00", "07:20"),
+                  mk("compare", 4, "08:00", "08:05"),
+                  mk("compare", 5, "06:00", "06:05")]
+    rep = analyse(day(3) + prev_cycle
+                  + [mk("refresh", 5, "01:00", "01:09", ok=False),
+                     mk("refresh", 5, "02:00", "02:09", ok=False)],
+                  chain, rows=0)
+    check(rep["verdict"] == FAILED and [f["stage"] for f in rep["findings"]]
+          == ["refresh"] and "only ok run" in rep["findings"][0]["text"],
+          "today's failed refresh is not hidden by yesterday's late ok "
+          "refresh  <-- pinned defect")
+    check("failed at 2026-03-05 02:00:00" in rep["findings"][0]["text"]
+          and 1 not in rep["chosen"],
+          "the finding names the latest failure, and the stale ok refresh is "
+          "not chosen")
+    check(analyse(day(3) + prev_cycle, chain, rows=0)["verdict"]
+          == NOTHING_CHANGED,
+          "without the failure, that late refresh is still accepted by the "
+          "cycle length")
+    check(analyse(prev_cycle + [mk("refresh", 4, "08:00", "08:09", ok=False)],
+                  chain, rows=0)["verdict"] == NOTHING_CHANGED,
+          "a failure that started the second the previous compare started "
+          "is that cycle's, not this one's")
+    check(analyse(prev_cycle + [mk("refresh", 5, "05:59", "06:30")],
+                  chain, rows=0)["verdict"] == NOTHING_CHANGED,
+          "known limit: an ok refresh that overlaps the compare is not seen, "
+          "and is never counted as a failure")
+    check(analyse(day(5) + [mk("refresh", 5, "04:00", "04:09", ok=False)],
+                  chain)["verdict"] == ORDERED,
+          "a failed rerun with no earlier compare to date the cycle is not "
+          "seen (see Limits)")
+
+    # ---- years below 1000 print the same on every host
+    check(stamp(datetime.datetime(500, 3, 5, 1, 2, 3)) == "0500-03-05 01:02:03",
+          "a year below 1000 is zero padded on every host  <-- pinned defect")
+    old = [mk("a", 5, "01:00", "01:10"), mk("b", 5, "02:00", "02:10")]
+    old = [r._replace(started=r.started.replace(year=500),
+                      finished=r.finished.replace(year=500)) for r in old]
+    check("judged: b, started 0500-03-05 02:00:00, rows reported: not given"
+          in render(analyse(old, ["a", "b"])),
+          "a report for such a year says 0500, not 500")
+
+    # ---- the clock the CLI reads
+    local_gap = system_now(False) - system_now(True)
+    check(abs(local_gap - datetime.datetime.now().astimezone().utcoffset())
+          < datetime.timedelta(seconds=5),
+          "system_now gives local time for a plain history and UTC for an "
+          "offset one")
+
     # ---- reading input
     check(parse_time("2026-03-05 06:00:00", "t") ==
           (datetime.datetime(2026, 3, 5, 6, 0, 0), False),
@@ -842,6 +1020,12 @@ def self_test():
     check(parse_time("2026-03-05 06:00:00+01:30", "t")[0] ==
           datetime.datetime(2026, 3, 5, 4, 30, 0),
           "a positive offset is folded into UTC")
+    check(parse_time("2026-03-05 06:00:00+01:00", "t")[1] is True
+          and parse_time("2026-03-05 06:00:00-01:00", "t")[1] is True,
+          "a numeric offset marks the time as aware  <-- pinned defect")
+    check(parse_time("2026-03-05 06:00:00+23:59", "t")[0] ==
+          datetime.datetime(2026, 3, 4, 6, 1, 0),
+          "the largest offset, +23:59, is accepted")
     for bad, why in (("2026-03-05 06:00", "no seconds"),
                      ("2026-03-05 6:00:00", "one digit hour"),
                      ("2026-03-05 06:00:00 PM", "12-hour text"),
@@ -908,6 +1092,13 @@ def self_test():
            "<-- pinned defect")
     raises(lambda: runs_from_pairs(pairs(started=ts(5, "06:00") + "Z")),
            "one row mixing offset and plain times is refused")
+    raises(lambda: runs_from_pairs(
+        pairs() + [[("task", "compare"),
+                    ("started", "2026-03-05 06:00:00+01:00"),
+                    ("finished", "2026-03-05 06:05:00+01:00"),
+                    ("result", "ok")]]),
+           "a history mixing a numeric offset and plain times is refused  "
+           "<-- pinned defect", text="mixes times")
 
     check(parse_chain("a, b ,c") == ["a", "b", "c"],
           "a chain is split on commas and trimmed")
@@ -929,8 +1120,8 @@ def self_test():
 
         head = "task,started,finished,result\n"
         body = "".join("%s,%s,%s,ok\n" % (r.task,
-                                          r.started.strftime(FMT),
-                                          r.finished.strftime(FMT))
+                                          stamp(r.started),
+                                          stamp(r.finished))
                        for r in healthy)
         csv_path = put("runs.csv", head + body)
         check(len(load_runs(csv_path)) == len(healthy),
@@ -944,8 +1135,8 @@ def self_test():
         check(len(load_runs(put("bom.csv", "\ufeff" + head + "\n" +
                                 body + "\n\n"))) == len(healthy),
               "a byte order mark and blank lines are tolerated")
-        js = json.dumps([{"Task": r.task, "Started": r.started.strftime(FMT),
-                          "Finished": r.finished.strftime(FMT),
+        js = json.dumps([{"Task": r.task, "Started": stamp(r.started),
+                          "Finished": stamp(r.finished),
                           "Result": "ok"} for r in healthy])
         json_path = put("runs.json", js)
         check(len(load_runs(json_path)) == len(healthy),
@@ -1004,8 +1195,8 @@ def self_test():
               "the CLI works without --rows")
 
         broken = put("broken.csv", head + "".join(
-            "%s,%s,%s,ok\n" % (r.task, r.started.strftime(FMT),
-                               r.finished.strftime(FMT))
+            "%s,%s,%s,ok\n" % (r.task, stamp(r.started),
+                               stamp(r.finished))
             for r in no_refresh))
         code, out, _ = cli(["--history", broken, "--chain",
                             "snapshot,refresh,compare", "--rows", "0"])
@@ -1056,7 +1247,7 @@ def self_test():
               "a unique prefix --ap of --apply is REFUSED by the parser  "
               "<-- pinned defect")
         for prefix in ("--rep", "--his", "--cha", "--ro", "--window",
-                       "--self"):
+                       "--self", "--no"):
             code, _, err = cli(base + [prefix, "x"])
             check(code == 2 and "unrecognized arguments" in err,
                   "the prefix %s is refused, not read as its full flag"
@@ -1110,18 +1301,20 @@ def self_test():
             lines = [head.rstrip("\n")]
             for r in runs:
                 lines.append("%s,%s,%s,%s" % (
-                    r.task, r.started.strftime(FMT),
-                    r.finished.strftime(FMT) if r.finished else "",
+                    r.task, stamp(r.started),
+                    stamp(r.finished) if r.finished else "",
                     "ok" if r.ok else "fail"))
             return put(name, "\n".join(lines) + "\n")
 
-        for name, runs, verdict in (("FAILED", failed_ref, "FAILED"),
-                                    ("newer-fail", cmp_fail, "FAILED"),
-                                    ("INVERTED", inverted, "INVERTED"),
-                                    ("stopped", stopped, "NOT_RUN")):
+        later = datetime.datetime(2026, 3, 7, 0, 0, 0)
+        for name, runs, verdict, at in (
+                ("FAILED", failed_ref, "FAILED", noon),
+                ("newer-fail", cmp_fail, "FAILED", later),
+                ("INVERTED", inverted, "INVERTED", noon),
+                ("stopped", stopped, "NOT_RUN", later)):
             code, out, _ = cli(["--history", dump(name + ".csv", runs),
                                 "--chain", "snapshot,refresh,compare",
-                                "--rows", "0"])
+                                "--rows", "0"], at)
             check(code == 1 and "VERDICT: %s" % verdict in out,
                   "the CLI exits 1 for %s (%s)" % (verdict, name))
         for bad in ("0", "-1", "nan", "inf"):
@@ -1140,6 +1333,54 @@ def self_test():
               "a time near year 1 with an offset exits 2, not a traceback  "
               "<-- pinned defect")
 
+        # ---- --now
+        code, out, _ = cli(base + ["--rows", "0", "--now",
+                                   "2026-03-05 07:00:00"])
+        check(code == 0 and "VERDICT: NOTHING_CHANGED" in out,
+              "--now just after the compare gives a clean verdict")
+        code, out, _ = cli(base + ["--rows", "0", "--now",
+                                   "2026-03-06 08:00:00"])
+        check(code == 1 and "VERDICT: NOT_RUN" in out
+              and "now is 2026-03-06 08:00:00" in out
+              and "does not show that nothing changed" in out,
+              "--now a day after the compare gives NOT_RUN, exit 1  "
+              "<-- pinned defect")
+        code, out, _ = cli(base + ["--rows", "0"], datetime.datetime(
+            2026, 3, 6, 8, 0, 0))
+        check(code == 1 and "VERDICT: NOT_RUN" in out,
+              "with no --now the clock is read, so the same day gives "
+              "NOT_RUN  <-- pinned defect")
+        code, out, _ = cli(base + ["--rows", "0"], datetime.datetime(
+            2026, 3, 4, 0, 0, 0))
+        check(code == 3 and "VERDICT: UNKNOWN" in out
+              and "before the newest run" in out,
+              "a clock before the newest run exits 3")
+        code, out, _ = cli(base + ["--rows", "0"], None)
+        check(code == 1 and "VERDICT: NOT_RUN" in out,
+              "with the real clock, a 2026-03 history is long stale")
+        code, _, err = cli(base + ["--now", "2026-03-06T08:00:00Z"])
+        check(code == 2 and "both use a Z" in err,
+              "--now with an offset against a plain history is refused")
+        code, _, err = cli(["--history", utc_path, "--chain",
+                            "snapshot,refresh,compare", "--now",
+                            "2026-03-06 08:00:00"])
+        check(code == 2 and "both use a Z" in err,
+              "--now without an offset against an offset history is refused")
+        code, out, _ = cli(["--history", utc_path, "--chain",
+                            "snapshot,refresh,compare", "--now",
+                            "2026-03-05T07:00:00+00:00"])
+        check(code == 0 and "06:00:00 UTC" in out,
+              "an offset history with --now in the same form is judged, and "
+              "says UTC  <-- pinned defect")
+        code, _, err = cli(base + ["--now", "yesterday"])
+        check(code == 2 and "--now:" in err,
+              "a --now that is not a time is refused")
+        code, out, _ = cli(["--history", empty, "--chain",
+                            "snapshot,refresh,compare", "--now",
+                            "2026-03-06T08:00:00Z"])
+        check(code == 3 and "the history holds no runs" in out,
+              "--now with an empty history is UNKNOWN, whatever its form")
+
     # ---- usage errors
     code, _, err = cli(["--chain", "a,b"])
     check(code == 2 and "--history is required" in err,
@@ -1155,7 +1396,8 @@ def self_test():
     code, _, err = cli(["--history", "nope.csv", "--chain", "a,b"])
     check(code == 2 and "cannot read" in err, "a missing history exits 2")
     for extra in (["--history", "x"], ["--chain", "a,b"], ["--rows", "1"],
-                  ["--window-hours", "5"], ["--report", "r"], ["--apply"]):
+                  ["--window-hours", "5"], ["--report", "r"], ["--apply"],
+                  ["--now", "2026-03-05 07:00:00"]):
         code, _, err = cli(["--self-test"] + extra)
         check(code == 2 and "takes no other flag" in err,
               "--self-test refuses %s" % extra[0])

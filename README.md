@@ -14,15 +14,16 @@ it concludes "a quiet night". Only one of the four is a quiet night.
 
 A fifth cause looks the same to a person who opens the folder. The compare job itself failed or
 stopped, and the empty file is an older one. A tool that judges "the last good compare" would
-bless it.
+bless it. This tool reads the clock for that case: when the last stage has had no run for more
+than one cycle, the verdict is `NOT_RUN`, on the first morning and not two days later.
 
 This case comes from reading a pipeline of this shape, not from an incident that I watched fail.
 The tool shows what it would catch. Every example in this README is synthetic.
 
-The tool reads a run history (one row per task run) and the order you declare for the chain. It
-judges the newest `ok` run of the last stage and gives one verdict. It does not trust that run if
-anything newer contradicts it. If the history is empty, the verdict is `UNKNOWN`. It is never
-"nothing changed".
+The tool reads a run history (one row per task run), the order you declare for the chain, and the
+time of the export. It judges the newest `ok` run of the last stage and gives one verdict. It
+does not trust that run if anything newer contradicts it. If the history is empty, the verdict is
+`UNKNOWN`. It is never "nothing changed".
 
 ```
 $ python taskorder.py --self-test
@@ -41,6 +42,11 @@ PASS  a newer compare that failed is FAILED, not a quiet night from the older co
 ...
 PASS  a compare that stopped running while the chain went on is NOT_RUN, not the old compare's verdict  <-- pinned defect
 ...
+PASS  the morning after the compare stopped, with the clock given, is NOT_RUN, not a quiet night  <-- pinned defect
+PASS  a whole chain that stopped months ago is NOT_RUN, not a clean verdict  <-- pinned defect
+...
+PASS  today's failed refresh is not hidden by yesterday's late ok refresh  <-- pinned defect
+...
 PASS  a unique prefix --ap of --apply is REFUSED by the parser  <-- pinned defect
 ...
 PASS  --report that resolves to the history file is refused, whatever its spelling  <-- pinned defect
@@ -48,10 +54,10 @@ PASS  --report that resolves to the history file is refused, whatever its spelli
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script
 --------------------------------------------------------------------
-179 assertions, 0 failed
+217 assertions, 0 failed
 ```
 
-The full run prints all 179 assertions. The `...` lines are where this block is cut.
+The full run prints all 217 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -70,15 +76,16 @@ The full run prints all 179 assertions. The `...` lines are where this block is 
 - **[taskpulse](https://github.com/uhsear/taskpulse)** (my own tool) audits Windows scheduled
   tasks one at a time. Its README describes per-task checks, a lint of each task's settings and a
   diff of two exports. It does not describe a check on the order between tasks.
-- **GitHub.** A search with `gh search repos taskorder --match name` on 2026-10-23 returned 35
-  repositories, this one among them. Of the others, 21 have no description. The rest are
-  to-do and task-priority apps, a task-ordering service, two interview or test exercises, three
-  scheduling-problem studies (one a genetic algorithm, one a dependency-ordering exercise), a
-  repository of project files and a small helper that waits for tasks. None describes a tool that reads a run history. The searches "scheduled task order
+- **GitHub.** A search with `gh search repos taskorder --match name` on 2026-10-23, and again on
+  2026-10-24, returned 35 repositories, this one among them. Of the others, 21 have no
+  description. The rest are to-do and task-priority apps, a task-ordering service, two interview
+  or test exercises, three scheduling-problem studies (one a genetic algorithm, one a
+  dependency-ordering exercise), a repository of project files and a small helper that waits for
+  tasks. None describes a tool that reads a run history. The searches "scheduled task order
   dependency empty report", "task scheduler pipeline stale snapshot compare" and "cron job
-  ordering check ran before upstream" returned nothing on the same day. A search finds public
+  ordering check ran before upstream" returned nothing on 2026-10-23. A search finds public
   repositories only. It does not show that no such tool exists, and I do not claim that one
-  does not.
+  does not. These counts were true on those two days and will change.
 
 Healthchecks.io and Airflow are better at what they do than this tool is. This tool answers
 a narrower question after the fact, from a history you already have: given these runs, was the
@@ -88,11 +95,11 @@ chain in order, and can an empty report be believed?
 
 Python 3.9 or newer and nothing else. No third-party package, no network, no credentials.
 
-The same 179 assertions pass on Windows (Python 3.13.2), on Windows with the Python 3.13.7 that
+The same 217 assertions pass on Windows (Python 3.13.2), on Windows with the Python 3.13.7 that
 ships with ArcGIS Pro, and on Ubuntu 24.04.5 (Python 3.12.3). The three runs print identical
 lines apart from line endings. The file passes `ast.parse(..., feature_version=(3, 9))`, and it
 uses no syntax from a newer release. No Python 3.9 interpreter was available, so the self-test
-was not run on 3.9.
+was not run on 3.9, and it was not run on 3.10 either.
 
 ```
 git clone https://github.com/uhsear/taskorder.git
@@ -103,11 +110,13 @@ git clone https://github.com/uhsear/taskorder.git
 1. Export the run history of your tasks to a CSV or JSON file (see "The history file").
 2. Name the stages in the order they must run. The last stage is the one that wrote the report.
 3. Give the number of rows the last stage reported, if you know it.
+4. If the file is not from this minute, give the time of the export with `--now`.
 
 ```
 python taskorder.py --history runs.csv --chain snapshot,refresh,compare --rows 0
 python taskorder.py --history runs.csv --chain snapshot,refresh,compare
 python taskorder.py --history runs.csv --chain snapshot,refresh,compare --window-hours 168
+python taskorder.py --history runs.csv --chain snapshot,refresh,compare --now "2026-03-06 07:00:00"
 python taskorder.py --history runs.csv --chain snapshot,refresh,compare --rows 0 --report order.txt --apply
 python taskorder.py --self-test
 ```
@@ -118,14 +127,20 @@ python taskorder.py --self-test
 | `--chain` | none | Stage task names in order, comma separated. At least two. The last stage is judged. Required. |
 | `--rows` | not given | Rows the last stage reported. With `0`, a clean chain gives `NOTHING_CHANGED`. Without it, a clean chain gives `ORDERED`. |
 | `--window-hours` | `24` | The length of one cycle. Set it to the real period of the chain (see Limits). |
+| `--now` | the system clock | When the history was exported, in the form of its times. The last stage is late when `--now` is more than one cycle after the judged run finished. |
 | `--report` | off | Write the report text to this file. Needs `--apply`. |
 | `--apply` | off | Write `--report`. Without it nothing is written. |
 | `--self-test` | off | Run the offline assertions and exit. Takes no other flag. |
 
+Without `--now`, the tool reads the clock of the machine that runs it. It uses UTC when the
+history has a `Z` or `+HH:MM` offset, and local time when it does not. Run the tool right after
+the export and the default is right. Give `--now` for an old file. `--now` must have an offset
+when the history has one, and must not have one when the history has none.
+
 The parser refuses an abbreviated flag, so `--ap` is not `--apply`. The self-test pins this for
-`--ap`, `--rep`, `--his`, `--cha`, `--ro`, `--window` and `--self`. `--report` and `--apply` are
-the only way the tool writes. The tool refuses a `--report` that resolves to the history file,
-including through a symbolic link.
+`--ap`, `--rep`, `--his`, `--cha`, `--ro`, `--window`, `--self` and `--no`. `--report` and
+`--apply` are the only way the tool writes. The tool refuses a `--report` that resolves to the
+history file, including through a symbolic link.
 
 Exit codes: 0 the chain ran in order, 1 it did not, 2 the input or a flag was unusable, 3 the
 history cannot answer. A time or `--window-hours` that is too large to calculate with exits 2.
@@ -154,30 +169,35 @@ of the chain in the file (see Limits).
 
 ## What it checks
 
-1. The judged run is the newest `ok` run of the last stage.
+1. The judged run is the newest `ok` run of the last stage, the one that started last.
 2. The tool looks for newer evidence. A failed run of any stage in the chain that started after
-   the judged run is `FAILED`. If the chain ran on for more than one cycle after the judged run
-   and the last stage has no newer run at all, that is `NOT_RUN`.
+   the judged run is `FAILED`. If the last stage has no newer run at all, and the clock (`--now`
+   or the system clock) is more than one cycle after the judged run finished, that is `NOT_RUN`.
+   If the chain ran on for more than one cycle after the judged run, that is `NOT_RUN` too, with
+   or without a clock.
 3. The tool walks back through the chain. For each earlier stage it looks for the latest `ok`
    run that finished before the next stage started, inside one cycle (`--window-hours` before the
    judged run).
-4. It looks for runs that broke the order.
+4. If that `ok` run is older than the start of the previous compare, it belongs to the previous
+   cycle. A failed run of the stage since the previous compare then gives `FAILED`.
+5. It looks for runs that broke the order.
 
 The verdict is the first of these that applies:
 
 | Verdict | Exit | When |
 |---|---|---|
-| `NOT_RUN` | 1 | A stage has no run at all in the cycle, and the history reaches back far enough to show it. Or the last stage has no run after the judged one while the chain ran on for more than one cycle. |
-| `FAILED` | 1 | A stage ran in the cycle and every run failed. Or a stage of the chain has a failed run that started after the judged run. |
+| `NOT_RUN` | 1 | A stage has no run at all in the cycle, and the history reaches back far enough to show it. Or the last stage has no run after the judged one while the chain ran on, or the clock moved on, for more than one cycle. |
+| `FAILED` | 1 | A stage ran in the cycle and every run failed. Or a stage of the chain has a failed run that started after the judged run. Or a stage failed after the previous compare and its only `ok` run is older than that compare. |
 | `INVERTED` | 1 | A stage only ran after the next stage had started, or an earlier stage ran again after a later stage finished and before the last stage started. |
-| `UNKNOWN` | 3 | The history is empty, the last stage has no `ok` run, or a stage is missing and the history starts too late to show that it did not run. |
+| `UNKNOWN` | 3 | The history is empty, the last stage has no `ok` run, a stage is missing and the history starts too late to show that it did not run, or the clock is earlier than the newest run. |
 | `CHANGED` | 0 | The chain ran in order and `--rows` is above 0. |
 | `NOTHING_CHANGED` | 0 | The chain ran in order and `--rows` is 0. |
 | `ORDERED` | 0 | The chain ran in order and `--rows` was not given. |
 
 Equal times follow one rule. A stage that finishes the second the next one starts is in order. A
 stage that starts the second the next stage starts did not run before it. An earlier stage that
-starts again the second a later stage finishes is out of order.
+starts again the second a later stage finishes is out of order. A clock exactly one cycle after
+the judged run finished is not yet late. One second more is late.
 
 The report lists every finding, not only the one in the verdict. When `--rows` is 0 and the
 verdict is not a clean one, the report adds a line that says the empty report does not show that
@@ -190,11 +210,12 @@ there and names the time the history starts.
 ### Worked example
 
 These are real outputs for the synthetic three-day history in "The history file", with every day
-run at the same times, on Windows and on Ubuntu. Each run uses `--chain snapshot,refresh,compare
---rows 0`. The `MEANING` line of each run is left out to save space. Every other line is as
-printed.
+run at the same times, on Windows and on Ubuntu. The two hosts printed identical text. Each run
+uses `--chain snapshot,refresh,compare --rows 0` and a `--now`, given in the heading. The
+`MEANING` line of each run is left out to save space, except in the last example. Every other
+line is as printed.
 
-The healthy history (exit 0):
+The healthy history, exported at 07:00 on 2026-03-05 (exit 0):
 
 ```
 taskorder: chain snapshot -> refresh -> compare, one cycle = 24 h
@@ -258,6 +279,35 @@ NOTE: the empty report does not show that nothing changed.
 VERDICT: NOT_RUN
 ```
 
+The snapshot and refresh of 2026-03-06 ran, and the compare did not. The file is read that
+morning (`--now` 2026-03-06 08:00:00). Before the tool used a clock, this history gave
+`NOTHING_CHANGED` and exit 0. Now it gives exit 1:
+
+```
+taskorder: chain snapshot -> refresh -> compare, one cycle = 24 h
+judged: compare, started 2026-03-05 06:00:00, rows reported: 0
+  snapshot     2026-03-05 01:00:00 .. 2026-03-05 01:02:00  ok
+  refresh      2026-03-05 02:00:00 .. 2026-03-05 02:20:00  ok
+  compare      2026-03-05 06:00:00 .. 2026-03-05 06:05:00  ok
+FINDING NOT_RUN: no run of compare after the judged one at 2026-03-05 06:00:00, and now is 2026-03-06 08:00:00, more than 24 h after it finished
+NOTE: the empty report does not show that nothing changed.
+VERDICT: NOT_RUN
+```
+
+Everything stopped and the file is read months later. The same healthy history, with `--now`
+2026-10-24 09:00:00 (exit 1). Without `--now` the tool reads the clock and says the same:
+
+```
+taskorder: chain snapshot -> refresh -> compare, one cycle = 24 h
+judged: compare, started 2026-03-05 06:00:00, rows reported: 0
+  snapshot     2026-03-05 01:00:00 .. 2026-03-05 01:02:00  ok
+  refresh      2026-03-05 02:00:00 .. 2026-03-05 02:20:00  ok
+  compare      2026-03-05 06:00:00 .. 2026-03-05 06:05:00  ok
+FINDING NOT_RUN: no run of compare after the judged one at 2026-03-05 06:00:00, and now is 2026-10-24 09:00:00, more than 24 h after it finished
+NOTE: the empty report does not show that nothing changed.
+VERDICT: NOT_RUN
+```
+
 An empty history (exit 3):
 
 ```
@@ -275,17 +325,35 @@ VERDICT: UNKNOWN
   refresh of 2026-03-04 as this cycle's and then reports the snapshot as `INVERTED`, where the
   24 hour window gives `NOT_RUN`. I ran this. The self-test also covers a 72 hour window that
   accepts an older refresh. Set the window to the real period.
-- **The tool has no clock.** It judges the newest `ok` run of the last stage in the file. If
-  every stage stopped, an old clean chain still gives a clean verdict. Check the judged time that
-  the tool prints. A history exported long after the last compare gets a clean verdict if that
-  compare was in order.
+- **The clock must be right.** The tool compares `--now`, or the system clock, with the time the
+  judged compare finished. A history in a time zone other than the machine's, without an offset,
+  is compared with the wrong time. Give `--now` in the zone of the history. A clock earlier than
+  the newest run gives `UNKNOWN`, not a verdict.
+- **An old file needs `--now`.** An export taken long after everything stopped gives a clean
+  verdict only if `--now` is set to the time of the export. Without `--now` the tool reads today's
+  clock and says `NOT_RUN`. The tool prints the judged time. Check it against today's date.
 - **A compare that is not yet due is not flagged.** If the snapshot and refresh of a new cycle
-  have run and the compare has not, the tool judges the compare of the cycle before. It flags the
-  missing compare only when the chain has run on for more than one cycle.
+  have run, and the clock is less than one cycle after the judged compare finished, the tool
+  judges the compare of the cycle before. A compare that is still running when you export is
+  late once one cycle has passed. Export again after it ends.
+- **A chain that does not run every day needs a longer cycle.** A chain that runs on weekdays
+  only has a gap of 72 hours at the weekend. With the default cycle, a Monday export that has the
+  Monday snapshot and refresh and no Monday compare gives `NOT_RUN` for the Friday compare. With
+  `--window-hours 72` the same file gave `NOTHING_CHANGED`, which is right before the Monday
+  compare is due.
+- **Each stage is assumed to run once per cycle.** A task that runs more than once per cycle by
+  design (for example an hourly snapshot) gives `INVERTED` every time, because any `ok` rerun of
+  an earlier stage between the chosen run's finish and the compare start counts as out of order.
+- **A failed run counts even when a retry fixed it.** A failed run of any chain stage that
+  starts after the judged compare gives `FAILED` for the judged cycle, even when a retry of that
+  stage succeeded later. A failed-then-retried refresh in the next cycle therefore turns the
+  previous cycle's valid empty report into exit 1. A snapshot that failed at 01:00 and succeeded
+  at 01:30, before the compare was due, reads `FAILED` in the same way.
 - **A failed rerun of an earlier stage is mostly not seen.** If a refresh ran at 02:00 and
   succeeded, and then ran again at 04:00 and failed part way, the tool judges the 02:00 run and
   says `ORDERED`. A failed snapshot rerun between the refresh and the compare is not seen either.
-  The tool does see a failed run that starts after the judged compare. The self-test pins both
+  The tool does see a failed run that starts after the judged compare. It also sees a failed run
+  when the only `ok` run before it is older than the previous compare. The self-test pins the
   known gaps.
 - **An earlier-stage rerun that starts during a later stage is only partly seen.** A second `ok`
   snapshot at 02:05-02:07, during a refresh at 02:00-02:20, is not flagged when the normal 01:00
@@ -302,6 +370,8 @@ VERDICT: UNKNOWN
   `NOT_RUN` for a young stage, where `UNKNOWN` would be the honest answer.
 - **Export only finished runs.** A row with no result stops the tool with exit 2, so a run
   still going when you exported the history must be left out.
+- **A last stage with only failed runs gives `UNKNOWN`, not `FAILED`.** The exit code is 3 and
+  the finding says "no successful run of compare". It does not say that the compare failed.
 - **Times without an offset are taken as written.** Across a daylight saving change, a local
   time can occur twice or not at all, and a naive history can then order two runs the wrong way
   round. Export times with an offset or in UTC. With offsets, only the `judged:` line carries
@@ -309,27 +379,48 @@ VERDICT: UNKNOWN
 - **The tool never guesses a format.** Fractional seconds (`01:00:00.123`), 12-hour clock text,
   an offset such as `+0100` with no colon, and a semicolon-delimited CSV are refused with exit 2.
   A UTF-16 CSV, as Windows PowerShell 5 writes with `Export-Csv -Encoding Unicode` or with `>`,
-  is refused as "not UTF-8 text". Save it again as UTF-8.
+  is refused as "not UTF-8 text". Save it again as UTF-8. A CSV with bare CR line endings
+  is refused as "not readable CSV". Save it again with CRLF or LF.
 - **PowerShell 5.1 `Export-Csv` needs `-NoTypeInformation`.** Its `#TYPE ...` first line, and a
   trailing comma on data rows, make a row longer than the header and stop the tool with exit 2.
-  A whitespace-only line in the middle of a CSV stops it too, with "no started column". The same
-  line at the end of the file is dropped.
+  A whitespace-only line in the middle of a CSV stops it too, with "row 2: no 'started' column
+  or cell". The same line at the end of the file is dropped.
 - **A header with the wrong names gives `UNKNOWN`.** A header-only CSV with other column names is
   an empty history, so the verdict is the safe one, but the message does not name the cause.
+- **Task names are matched as written, apart from case.** A name that contains a comma cannot be
+  named in `--chain`. Two names that differ only by Unicode normalization (a precomposed accent
+  against a combining accent) do not match each other.
 - **A repeated key in a JSON object keeps the last value.** This is what Python's JSON reader
   does. The duplicate check covers CSV headers and case variants of a name, not repeated JSON keys.
 - **One late run can be reported twice.** A run that is out of order after two later stages
   gets one `INVERTED` line for each. The verdict is the same.
-- **`--report` replaces what is at that path.** With `--apply` the tool overwrites any file there.
-  Only the history file is guarded, by its resolved path. A hard link to the history is not
-  detected.
+- **`--report` replaces what is at that path.** With `--apply` the tool overwrites any file there,
+  including this script. Only the history file is guarded, by its resolved path. A hard link to
+  the history, an 8.3 short name, a Windows junction and a reserved device name such as `NUL` are
+  not detected. I ran a hard link: the history was overwritten. The report is written in place,
+  so a crash or a full disk during `--apply` leaves a cut report. The history is never touched
+  by a crash.
+- **A report that cannot be written comes after the verdict.** The tool prints the report first.
+  If `--report` then fails, the run shows a `VERDICT:` line and exits 2.
 - **A closed output pipe is not handled.** The tool prints once and has no handler for a reader
-  that closes early.
+  that closes early. With `| head -c 0` on Windows, Python printed "Exception ignored on flushing
+  sys.stdout" and the exit code was 120, which is outside the four codes above.
 - **A large number of levels or a huge field is refused, not parsed.** Nesting a JSON history
   100000 levels deep, and a CSV field over the size limit of Python's `csv` module, give exit 2.
-- **Python 3.9 was not run.** The syntax is checked for 3.9, and the self-test ran on 3.12 and
-  3.13 only. A NUL byte in a CSV was not tried on 3.9 or 3.10. The oversize-field test reaches
-  the same `csv.Error` handler.
+  A time in year 1 or year 9999 that the cycle arithmetic cannot handle gives exit 2 with an
+  "outside the range" message, not a verdict.
+- **The self-test cannot catch a break in its own harness.** Removing `failed.append(label)`
+  from `check()`, or `return 1` from `finish()`, still exits 0. The check that would notice is
+  counted by the broken harness. The assertion count drops by one in the first case, so compare
+  the count with the one in this README.
+- **The self-test does not assert every line of text.** It does not assert the `MEANING` line, the
+  per-stage chosen-run lines, or most times inside finding text. Swapping `started` and
+  `finished` in the chosen-run lines, using `min` for `max` in "history starts at" or "only ran at",
+  or using the wrong stage in the `INVERTED` text passes the self-test. The worked examples above
+  are real output, but the self-test does not pin them.
+- **Python 3.9 and 3.10 were not run.** The syntax is checked for 3.9, and the self-test ran on
+  3.12 and 3.13 only. A NUL byte in a CSV was not tried on 3.9 or 3.10. The oversize-field test
+  reaches the same `csv.Error` handler.
 
 ## How each claim was checked
 
@@ -339,7 +430,11 @@ VERDICT: UNKNOWN
 | A missing refresh is `NOT_RUN`, exit 1 | The self-test and a real run on the synthetic history, on both hosts. |
 | A snapshot after the refresh is `INVERTED`, exit 1 | The self-test (a late snapshot, a second snapshot, a snapshot still running when the refresh started) and a real run. |
 | A newer failed compare is `FAILED`, exit 1 | The self-test (newer failure, no finished time, two failures, a failed compare that started with the judged one) and a real run on both hosts. |
-| A compare that stopped is `NOT_RUN`, exit 1; one that is not yet due is not flagged | The self-test, with the one-cycle edge on both sides, and real runs on both hosts. |
+| A compare that stopped is `NOT_RUN`, exit 1 | The self-test, with the one-cycle edge on both sides, and real runs on both hosts. |
+| A compare that is late by the clock is `NOT_RUN`, exit 1; one that is not yet due is not flagged | The self-test (due time to the second, a longer cycle, a whole chain stopped for months, a compare that did run and failed, a stopped compare listed once), and real runs on both hosts with `--now` and with the real clock. |
+| A clock earlier than the newest run is `UNKNOWN`, exit 3 | The self-test, in the core and through the command line, including a clock inside a long run. |
+| `--now` must match the history on offsets | The self-test (a plain `--now` on an offset history, the reverse, a bad text, an empty history). |
+| A failed refresh is not hidden by an older late `ok` refresh | The self-test (two failures, the second-by-second edge at the previous compare, an overlapping `ok` run) and a real run on both hosts. |
 | A history that is too short gives `UNKNOWN`, not `NOT_RUN` | The self-test, and a real run on a history cut to one day. |
 | CSV and JSON give the same verdict | The self-test, and a real run on a JSON copy of the same history. |
 | The exit code of every verdict | The self-test runs the CLI for `FAILED`, `INVERTED`, `NOT_RUN`, `NOTHING_CHANGED`, `CHANGED`, `ORDERED` and `UNKNOWN`. |
@@ -350,16 +445,17 @@ VERDICT: UNKNOWN
 | A huge `--window-hours`, or a time near year 1 with an offset, exits 2 | The self-test (`1e9`, `1e300` and `0001-01-01 00:00:00+05:00`). |
 | A deeply nested JSON file or an oversize CSV field exits 2 | The self-test (100000 levels, and a field of 200000 characters). |
 | A task name cannot forge a `VERDICT:` line | The self-test, with a newline and an escape character in the name. |
-| The format limits in "Limits" | Real runs on a UTF-16 file, fractional seconds, 12-hour text, `+0100`, a semicolon file, a `#TYPE` line, a trailing comma, a whitespace-only line, a header with other names, a row with no result and a repeated JSON key. |
-| Branch coverage | `coverage run --branch taskorder.py --self-test` gave 664 statements, 158 branches and 100 percent, with nothing missing. |
-| The checks can fail | A sweep of 71 deliberate one-line edits to the decision core, the readers, the parser and the writer: 69 made the self-test fail. The other two change no behaviour (see below). |
+| A year below 1000 prints the same on both hosts | The self-test (`0500-03-05` in a report). |
+| The format limits in "Limits" | Real runs on a UTF-16 file, fractional seconds, 12-hour text, `+0100`, a semicolon file, a `#TYPE` line, a trailing comma, a whitespace-only line, a CSV with bare CR line endings, a header with other names, a row with no result and a repeated JSON key. |
+| The `--report` limits in "Limits" | Real runs on Windows: a hard link to the history (overwritten), `--report` naming a copy of this script (overwritten), `--report NUL` (accepted), `--report .` (exit 2 after the verdict printed). |
+| The weekday limit | Real runs on a Friday-and-Monday history, with the default cycle and with 72 hours. |
+| The closed pipe limit | A real run with `head -c 0` on Windows: exit 120. |
+| Branch coverage | `coverage run --branch taskorder.py --self-test` gave 753 statements, 170 branches and 100 percent, with nothing missing. |
+| Two controls that could not fail now can | Two edits that the self-test used to miss: `return ..., False` for the numeric-offset branch of `parse_time`, and swapping the judged-run key to `(finished, started)`. Both now fail the self-test. I made each edit by hand and ran it. Other one-line edits that I tried on the clock and cycle code also fail it. The one edit that passes is the harness one in "Limits". |
 | The Healthchecks.io and taskpulse statements | The Healthchecks.io page and the taskpulse README were fetched on 2026-10-23 and read for the statements above. |
 
-The two edits the sweep did not catch are equivalent ones. Changing `finished > bound` to
-`finished >= bound` in the late-run branch changes nothing, because a run that finishes exactly at
-the bound has already been taken by the branch before it. Changing `rows == 0` to `rows <= 0` in the
-verdict changes nothing for the command line, which refuses a negative `--rows`. The sweep script
-is a scratch file and is not part of this repository.
+There is no sweep script in this repository. A count of edits that the self-test catches would
+not be something you can reproduce from here, so this README gives none.
 
 There is no network path. The tool never opens a socket, so there is nothing to stub.
 
